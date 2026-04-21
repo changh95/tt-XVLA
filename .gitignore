@@ -1,0 +1,23 @@
+# Model weights — ~3.3 GB, users download from HF themselves.
+weights/
+
+# Cached reference action chunk (regenerated on first torch_cpu run).
+reference/
+
+# Local benchmark logs.
+results.tsv
+run*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+.omc/
