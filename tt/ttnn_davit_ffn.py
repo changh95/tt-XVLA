@@ -16,12 +16,42 @@ modules) this dominates DaViT's parameter footprint.
 Each ported FFN takes a torch tensor in and returns a torch tensor out
 (plus the unchanged `size` tuple), matching the upstream signature so
 the `MySequential` wrapper still works.
+
+Two implementations: ``TTNNDaViTPreNormFFN`` (legacy, default, untouched: host tilize,
+LN, fc1+gelu, fc2, add, host untilize) and ``TTNNDaViTPreNormFFNFused`` (``TT_FUSED=1``:
+ROW_MAJOR upload, ``tilize_with_zero_padding``, LN, fc1+gelu, fc2 + residual -- one
+``dit_minimal_matmul_addcmul_fused`` when ``TT_FUSED_FC2_BF16=1``, else fc2 + add --,
+``untilize_with_unpadding``, ROW_MAJOR readback: 6 launches, no host layout work).
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 from torch import nn
+
+
+def _fused_module():
+    """Import ``tt/fused.py`` as a package sibling or by path (see ``tt/policy.py``)."""
+    import importlib
+    import importlib.util
+    import sys
+
+    pkg = __name__.rpartition(".")[0]
+    if pkg:
+        try:
+            return importlib.import_module(pkg + ".fused")
+        except ImportError:
+            pass
+    name = "xvla_ttnn_fused"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, str(Path(__file__).resolve().with_name("fused.py")))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _bf16_tile(ttnn_mod, t: torch.Tensor, device):
@@ -92,9 +122,58 @@ class TTNNDaViTPreNormFFN(nn.Module):
         return out, size
 
 
-def swap_davit_ffns(vision_tower: nn.Module, device) -> int:
+class TTNNDaViTPreNormFFNFused(nn.Module):
+    """``TT_FUSED=1`` variant of ``TTNNDaViTPreNormFFN``: ``x + fc2(gelu(fc1(LN(x))))`` with
+    ROW_MAJOR I/O and device tilize/untilize (exact data movement), fc1 bfp8 + exact erf GELU
+    (as legacy), fc2 bfp8 + ``add`` by default or bf16 + fused residual with
+    ``TT_FUSED_FC2_BF16=1`` (dtype rule of the fused kernel). Shapes per stage (3 views):
+    [3, 3136, 256] / [3, 784, 512] / [3, 196, 1024] / [3, 49, 2048] (tile-padded rows
+    3136/800/224/64; padded rows are LN(0)=beta garbage, row-wise ops only, dropped by the unpad)."""
+
+    def __init__(self, prenorm_torch: nn.Module, device, kit) -> None:
+        super().__init__()
+        self._fused = _fused_module()
+        self.kit = kit
+        self.cfg = kit.cfg
+        self._ttnn = kit.ttnn
+        self.device = device
+        norm = prenorm_torch.norm
+        net = prenorm_torch.fn.net
+        fc1, fc2 = net.fc1, net.fc2
+
+        def bias_or_zeros(lin):
+            return lin.bias.detach() if lin.bias is not None else torch.zeros(lin.out_features)
+
+        self.ln_w = kit.vec(norm.weight)
+        self.ln_b = kit.vec(norm.bias)
+        self.ln_eps = float(norm.eps)
+        self.fc1_w = kit.weight(fc1.weight.detach().t(), bf8=True)
+        self.fc1_b = kit.bias_row(bias_or_zeros(fc1))
+        self.fc2_w = kit.weight(fc2.weight.detach().t(), bf8=not self.cfg.fc2_bf16)
+        self.fc2_b = kit.bias_row(bias_or_zeros(fc2))
+
+    def forward(self, x: torch.Tensor, size):
+        kit = self.kit
+        B, T, C = x.shape
+        x_dev = kit.upload(x)
+        x_t = kit.ingest(x_dev)
+        h = kit.layer_norm(x_t, self.ln_w, self.ln_b, self.ln_eps)
+        h2 = kit.linear(h, self.fc1_w, self.fc1_b, gelu=True)
+        kit.free(h)
+        y = kit.linear_residual(h2, self.fc2_w, self.fc2_b, x_t)
+        kit.free(h2, x_t, x_dev)
+        y_out = kit.egress(y, (B, T, C))
+        if y_out is not y:
+            kit.free(y)
+        out = kit.readback(y_out).to(x.dtype)
+        kit.free(y_out)
+        return out, size
+
+
+def swap_davit_ffns(vision_tower: nn.Module, device, kit=None) -> int:
     """Walk the DaViT and replace each block's `ffn` PreNorm with the
-    on-device version. Returns the number of swaps made.
+    on-device version. Returns the number of swaps made. ``kit`` (a
+    ``fused.DeviceKit``, TT_FUSED=1) selects the fused class; None = legacy.
 
     DaViT's structure is:
         vision_tower.blocks: ModuleList[stage_seq]
@@ -110,6 +189,8 @@ def swap_davit_ffns(vision_tower: nn.Module, device) -> int:
                 stage_block = getattr(dual_block, sb_name, None)
                 if stage_block is None or not hasattr(stage_block, "ffn"):
                     continue
-                stage_block.ffn = TTNNDaViTPreNormFFN(stage_block.ffn, device).to(torch.bfloat16)
+                cls = TTNNDaViTPreNormFFN if kit is None else TTNNDaViTPreNormFFNFused
+                args = (stage_block.ffn, device) if kit is None else (stage_block.ffn, device, kit)
+                stage_block.ffn = cls(*args).to(torch.bfloat16)
                 swapped += 1
     return swapped
