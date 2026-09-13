@@ -5,10 +5,19 @@ Vision-Language-Action foundation model to a single Tenstorrent
 Blackhole p150a, via [TT-NN](https://github.com/tenstorrent/tt-metal).
 
 Starting from a torch CPU baseline of **10.75 frames/sec**, the final
-implementation runs at **181.42 frames/sec** — a **16.87× speedup** on
-synthetic inputs, while keeping implementation PCC vs the fp32 torch
-reference at **99.998%** and open-loop action MAE vs real-dataset GT
-within **+0.00%** of the fp32 reference.
+implementation runs at **315–338 frames/sec** (two `run_benchmark.py`
+runs, 1 denoising step, 16 language tokens, measured on the p150a on
+2026-09-13) — a **29–31× speedup** on synthetic inputs, while keeping
+implementation PCC vs the fp32 torch reference at **99.9982%** and
+open-loop action MAE vs real-dataset GT within **+0.00%** of the fp32
+reference. Per 30-step action chunk that is a warm median of **89–95 ms**
+in-process (1 denoising step; 168–173 ms at 10 steps) against 177 ms /
+309 ms for the eager op chain, and **94 ms / 174 ms** served over HTTP
+(legacy 185 ms / 308 ms). The speed-up comes from the fused / traced
+device path (`TT_FUSED`, default on; `TT_FUSED=0` restores the previous
+eager path bit for bit) — see [Fused device path](#fused--traced-device-path-tt_fused)
+and [`DEVICE_VALIDATION.md`](DEVICE_VALIDATION.md) for every measured
+number.
 
 ## What runs where
 
@@ -23,30 +32,43 @@ Pipeline components and their execution location in the final build:
 | Florence-2 DaViT WindowAttention (12 modules) | — | Blackhole p150a |
 | DaViT ConvEmbed + DepthWiseConv2d | ~30 M | torch CPU (see [Open items](#open-items)) |
 | Token / positional embedding lookups | — | torch CPU (small lookups) |
-| Window partition / reverse | — | torch CPU (6-D reshape) |
+| Window partition / reverse | — | Blackhole p150a (rank-4 RM reshape / permute / pad / slice; `TT_FUSED_WINDOWS_ON_DEVICE=1`); torch CPU with `TT_FUSED=0` |
 | Pre/post processing (flow-matching bookkeeping) | — | torch CPU |
 
+With the default fused path the 24-block transformer stack and the
+12-layer BART encoder each run as ONE captured metal trace (replayed per
+denoising step / per chunk); the DaViT stays 48 eager device round trips
+per chunk because its depthwise 3×3 convs and ConvEmbed are still on the
+CPU (84 % of the fused chunk, see [Open items](#open-items)).
+
 Numerics on-chip: bf16 activations throughout; bfp8_b weights on the
-transformer MLPs and DaViT FFN MLPs (large matmuls). Attention weights
-stay bf16 for precision.
+fc1 of the transformer MLPs, BART MLPs and DaViT FFN MLPs (large
+matmuls). Attention weights stay bf16 for precision. On the fused path
+the fc2 weights are bf16 so that fc2 + residual fuse into one kernel
+(`TT_FUSED_FC2_BF16=1`, +230 MiB DRAM); with `TT_FUSED=0` fc2 is bfp8_b
+as before.
 
 ## Layout
 
 ```
 tt-xvla/
 ├── README.md                 # you are here
+├── DEVICE_VALIDATION.md      # fused-path knobs, gates and the measured p150a results (2026-09-13)
 ├── __init__.py
 ├── benchmark/
 │   ├── run_benchmark.py      # end-to-end metric harness (frozen oracle)
 │   └── lerobot_bootstrap.py  # workarounds for two unrelated lerobot import bugs
 ├── tt/                       # the TT-NN port
-│   ├── policy.py             # loader — monkey-patches on-chip components
+│   ├── policy.py             # loader — monkey-patches on-chip components (legacy or *Fused classes)
+│   ├── fused.py              # TT_FUSED knobs (FusedConfig), torch reformulations, DeviceKit, TracedGraph
 │   ├── ttnn_env.py           # sets TT_METAL_HOME + sys.path for kernel sources
 │   ├── ttnn_block_stack.py   # SoftPromptedTransformer 24 blocks
 │   ├── ttnn_bart_encoder.py  # Florence-2 BART encoder
 │   ├── ttnn_davit_ffn.py     # DaViT 24 FFN modules
 │   ├── ttnn_davit_channel_attn.py  # DaViT ChannelAttention (4-D only)
-│   └── ttnn_davit_window_attn.py   # DaViT WindowAttention
+│   ├── ttnn_davit_window_attn.py   # DaViT WindowAttention
+│   └── tests/
+│       └── test_fused_host.py      # torch-only host tests of the fused reformulations (no device)
 └── eval/
     ├── README.md
     ├── eval_relative_pcc.py  # implementation fidelity vs fp32 torch
@@ -101,8 +123,115 @@ accuracy=<PCC % vs the cached reference action chunk; 100.0 on first ever run>
 peak_dram=<peak DRAM MB; 0 on torch_cpu>
 ```
 
-Device id for `ttnn` is fixed at `3` in `tt/policy.py`. Change
-`_open_device()` if you need a different chip.
+The `ttnn` backend runs the fused / traced path by default; add
+`TT_FUSED=0` in front of either command to run the previous eager op
+chain (bit-identical to the 2026-09-12 code). The chip id comes from
+`TT_DEVICE_ID` (default `0`); the original port hard-coded id 3 for the
+author's multi-card box — `TT_DEVICE_ID=3` reproduces that.
+
+Measured on the p150a on 2026-09-13 (shipped tt-model image, tt-metal
+v0.71.0-dev20260509-4, `run_benchmark.py`, 1 denoising step): legacy
+163–170 fps (176.9–183.6 ms per chunk), fused 315–338 fps, `accuracy`
+99.9991 % (PCC vs the legacy seed-42 reference chunk).
+
+## Fused / traced device path (`TT_FUSED`)
+
+`tt/fused.py` + the `*Fused` classes in the five `tt/ttnn_*.py` modules
+form a second implementation of every on-chip component; `tt/policy.py`
+picks it when `TT_FUSED` is unset or `1` and the legacy classes when
+`TT_FUSED=0`. The legacy classes are untouched, so `TT_FUSED=0` is bit
+for bit the previous behaviour (verified on the device: identical action
+chunks at 1 and 10 steps). All knobs are read ONCE per process, at model
+build (`FusedConfig.from_env`), so set them before the first
+`load_policy_ttnn` call.
+
+What it changes, per action chunk (1 step): 748 device launches instead
+of 973 as counted from the code (`fused.fused_launches_per_chunk()`, a
+tally not a measurement; bfp8 fc2), of which 353 are replayed from two
+metal traces:
+
+- **ROW_MAJOR I/O** (`TT_FUSED_RM_IO=1`): RM upload + `tilize_with_zero_padding`
+  on device, `untilize_with_unpadding` + RM readback on all 48 DaViT round
+  trips, BART and the stack — exact data movement, no host tilize.
+- **Metal traces** (`TT_FUSED_TRACE=1`, `TT_FUSED_TRACE_REGION_MB=64`): the
+  24-block transformer stack and the 12-layer BART encoder are each captured
+  as one trace with a persistent RM input on the first (warm-up) chunk and
+  replayed afterwards; the device is opened with `trace_region_size` and the
+  program cache on. The two traces need < 8 MB (measured), so 64 MB is > 8×
+  headroom. Eager fallback if capture fails or the input shape changes.
+- **SDPA** (`TT_FUSED_SDPA=1`): `scaled_dot_product_attention` over the
+  tile-padded sequence (stack 244→256, BART 82→96, DaViT windows 144→160)
+  with no explicit mask; the kernel masks padded keys (PCC unchanged).
+- **Matmul + residual fusion** (`TT_FUSED_DIT=1`): `dit_minimal_matmul_addcmul_fused`
+  for proj + residual in the stack and channel attention, and fc2 + residual
+  where fc2 is bf16 (`TT_FUSED_FC2_BF16=1`).
+- **`minimal_matmul`** (`TT_FUSED_MINIMAL_MM=1`) for qkv / fc1 / out-proj
+  (`TT_FUSED_MM_FIDELITY` / `TT_FUSED_MM_FP32ACC` select the compute kernel
+  config; `""` = op default HiFi2 + fp32 accumulation).
+- **BART**: post-LN residual adds fused into `layer_norm(residual_input_tensor=)`
+  (`TT_FUSED_LN_RESIDUAL=1`); the additive mask is skipped when the 2-D mask
+  is all ones (always, in `forward_vlm`).
+- **DaViT channel attention with head ops** (`TT_FUSED_CATTN=1`): 21 → 12/13
+  launches per module; a constant zero mask feeds `scale_mask_softmax_in_place`
+  because this tree refuses a scale without a mask (the one device fix of the
+  validation pass).
+- **DaViT window partition / reverse / pad / unpad + residual on device**
+  (`TT_FUSED_WINDOWS_ON_DEVICE=1`): per-block upload of 1.2 MB tokens instead
+  of 3.5 MB windows at stage 2. Not bit-identical to the host path (the
+  residual add became a device bf16 add, max abs diff 3.9e-3 on the chunk;
+  PCC vs fp32 unchanged).
+- **Stack readback** (`TT_FUSED_STACK_OUT_ROWS=-1`): only `ceil32(chunk_size)`
+  = 32 rows come back (the transformer reads `x[:, :30]`); `0` = all 244 rows.
+- Off by default, kept as A/B knobs: `TT_FUSED_LN_EPS_REF=1` (module eps 1e-5
+  instead of ttnn's 1e-12; no accuracy change measured) and
+  `TT_FUSED_MM_FIDELITY=HiFi2 TT_FUSED_MM_FP32ACC=0` (same speed, lower PCC).
+
+Every knob's exactness class, the A/B ladder (one knob at a time, ms and
+PCC), the per-stage time split and the memory numbers are in
+[`DEVICE_VALIDATION.md`](DEVICE_VALIDATION.md). The measured A/B on the
+p150a (in-process, N=20 warm, medians; PCC = `eval_relative_pcc.py`,
+5 seeds × 10 steps):
+
+| configuration | ms / chunk, 1 step | 10 steps | mean PCC vs fp32 |
+|---|---:|---:|---|
+| legacy (`TT_FUSED=0`) | 176.9 | 320.9 | 0.999981 |
+| fused, kernel swaps off (`TT_FUSED_MINIMAL_MM=0 TT_FUSED_FC2_BF16=0 TT_FUSED_WINDOWS_ON_DEVICE=0`) | 112.4 | 206.4 | 0.999981 |
+| **fused, defaults** | **94.5** (alternating rounds 89.4) | **173.4** (168.0) | **0.999982** |
+
+Served over HTTP (30 warm `/predict` requests, medians): legacy 184.9 ms →
+fused 94.4 ms at 1 step, 308.4 → 174.3 ms at 10 steps; a 2.0× / 1.8×
+speed-up. Extra denoising steps cost ~8.4 ms each on the fused path
+(legacy ~16.5 ms) because the stack trace replays.
+
+```bash
+# fused path (default) and the legacy path, same benchmark
+python3 benchmark/run_benchmark.py --backend ttnn
+TT_FUSED=0 python3 benchmark/run_benchmark.py --backend ttnn
+
+# one knob off for an A/B (all knobs are read once at model build)
+TT_FUSED_SDPA=0 python3 benchmark/run_benchmark.py --backend ttnn
+
+# fidelity of the fused path vs fp32 torch (same numbers as the table above)
+python3 eval/eval_relative_pcc.py --backends torch_cpu,ttnn --steps 10 --seeds 5
+```
+
+### Host tests (no device)
+
+`tt/tests/test_fused_host.py` proves every exact reformulation the fused
+device code relies on against the reference math in torch (tile
+arithmetic, ttnn head split/merge, the channel-attention restructure and
+its zero-filled tile padding, the 4-D window partition / reverse, the BART
+all-ones-mask shortcut, the launch-count table) and the knob plumbing
+(`TT_FUSED` unset → fused defaults, `TT_FUSED=0` → legacy). It imports no
+`ttnn` and creates no device tensors, so it runs on any host with torch
+and pytest:
+
+```bash
+# from the repo root; the tree's python_env has torch 2.7.1 + pytest
+python3 -m pytest tt/tests/test_fused_host.py -q     # -> 20 passed
+# or as a plain script (asserts)
+python3 tt/tests/test_fused_host.py
+```
 
 ## Evaluation
 
@@ -125,10 +254,13 @@ Observed (5 seeds, steps=10):
 | backend   | mean PCC | min PCC  | mean \|err\|/std(ref) | max abs err |
 |-----------|----------|----------|-----------------------|-------------|
 | torch_cpu | 1.000000 | 1.000000 | 0.00e+00              | 0.00e+00    |
-| ttnn      | 0.999983 | 0.999983 | 4.66e-03              | 4.57e-03    |
+| ttnn, fused (default; p150a 2026-09-13) | 0.999982 | 0.999979 | 4.78e-03 | 8.15e-03 |
+| ttnn, `TT_FUSED=0` (same pass) | 0.999981 | 0.999978 | 4.90e-03 | 6.42e-03 |
+| ttnn, `TT_FUSED=0` (original port run) | 0.999983 | 0.999983 | 4.66e-03 | 4.57e-03 |
 
 A clean port is `>= 99.9%` mean PCC and `rel_err < 1%`. We are well
-under both bars.
+under both bars; the fused path is marginally *closer* to fp32 than the
+eager chain (SDPA and `minimal_matmul` keep fp32 statistics / accumulation).
 
 ### 2. Open-loop dataset evaluation — real GT actions
 
@@ -152,7 +284,13 @@ Observed backend-delta (10 samples, pusht_image, skip-postprocess):
 | backend   | MAE        | Delta vs fp32 |
 |-----------|------------|---------------|
 | torch_cpu | 2.5378e+02 | —             |
-| ttnn      | 2.5378e+02 | +4.27e-04 (+0.00 %) |
+| ttnn, fused (default; p150a 2026-09-13) | 2.5378e+02 | +4.73e-04 (+0.00 %) |
+| ttnn, `TT_FUSED=0` (same pass) | 2.5378e+02 | +3.66e-04 (+0.00 %) |
+| ttnn, `TT_FUSED=0` (original port run) | 2.5378e+02 | +4.27e-04 (+0.00 %) |
+
+On a second, 50-sample slice (`--num-samples 50 --start-index 1000`,
+see `DEVICE_VALIDATION.md` "Results" §3) the fused path measured MAE
+234.09 vs 234.09, delta −4.58e-05 (−0.00 %).
 
 The absolute MAE is large because the base X-VLA checkpoint was never
 fine-tuned on pusht; the useful signal is the **delta** between
@@ -171,7 +309,9 @@ estimator. See `eval/README.md` for the open-item record.
 
 Autoresearch loop — one atomic change per iteration, commit, run
 benchmark, keep if speed improved and PCC ≥ 99%, else revert. Ran 20
-iterations, 11 kept, 9 discarded.
+iterations, 11 kept, 9 discarded; iteration 21 is the fused / traced
+device path, gated on the device per knob (A/B ladder in
+`DEVICE_VALIDATION.md`) rather than by this loop.
 
 | iter | gen_speed (fps) | PCC     | status  | change |
 |------|-----------------|---------|---------|--------|
@@ -196,7 +336,8 @@ iterations, 11 kept, 9 discarded.
 | 18   | 137.72          | 99.9782 | keep    | DaViT 24 FFN modules on Blackhole, bfp8 MLP weights |
 | 19   | 128.89          | 99.9785 | discard | ChannelAttention with mid-block torch round-trips — transfers > compute |
 | 19v2 | 144.27          | 99.9785 | keep    | ChannelAttention on chip, **4-D ttnn ops only** (no round-trips) |
-| 20   | **181.42**      | 99.9777 | keep    | **WindowAttention on Blackhole** (12 spatial blocks, manual SDPA over padded windows) |
+| 20   | 181.42          | 99.9777 | keep    | **WindowAttention on Blackhole** (12 spatial blocks, manual SDPA over padded windows) |
+| 21   | **315–338**     | 99.9991 | keep    | **Fused / traced device path** (`TT_FUSED`, default on): ROW_MAJOR I/O + device tilize/untilize, SDPA, `minimal_matmul`, matmul+residual and LN+residual fusions, channel-attention head ops, DaViT window permutes on device, block stack + BART encoder as metal traces. Validated on the p150a 2026-09-13 ([`DEVICE_VALIDATION.md`](DEVICE_VALIDATION.md)); its PCC column is vs the iter-20 seed-42 chunk (`run_benchmark.py accuracy=`), the fp32 PCC is 0.999982. `TT_FUSED=0` = iter 20 |
 
 Patterns that worked:
 
@@ -215,6 +356,12 @@ Patterns that worked:
 - **Drop denoising steps aggressively for this flow-matching model.**
   iter3–5 knocked `num_denoising_steps` from 10 to 1 for a 2.75×
   speedup with a PCC drop of only ~0.02%.
+- **Cut launches and host round trips before tuning kernels** (iter21).
+  RM I/O with device tilize/untilize, two metal traces and the fused
+  matmul+residual / LN+residual kernels took the chunk from 177 to 112 ms
+  with unchanged PCC; the kernel swaps (`minimal_matmul`, bf16 fc2,
+  windows on device) added the last 18 ms. Compute-kernel fidelity
+  overrides on top of that gained nothing (dropped).
 
 Patterns that failed:
 
@@ -229,14 +376,33 @@ Patterns that failed:
 - **DaViT ConvEmbed + DepthWiseConv2d port.** `ttnn.conv2d` hit an
   allocator failure with a first-pass depthwise config; would need
   sharded-memory and conv-config tuning. These are the largest remaining
-  torch CPU consumers.
-- **Flash-2 SDPA** in the transformer block stack: blocked on seq-length
-  padding to a 32-tile boundary.
-- **Closed-loop simulator evaluation** (item 3 above).
+  torch CPU consumers (~21 ms of the 87 ms fused chunk) and the reason the
+  DaViT is still 48 eager device calls instead of one trace — the DaViT is
+  84 % of the fused chunk.
+- **Closed-loop simulator evaluation** (item 3 above). Only open-loop MAE
+  (pusht_image, 10 + 50 samples) and the action-chunk PCC were measured
+  for the fused path.
+- **Fused-path items not measured**: cold-kernel-cache boot time of the
+  fused path in a fresh image (the served runs used a warm kernel cache,
+  READY in 20–22 s; the first fused chunk with cold kernels took 13.8 s
+  plus ~1 s trace capture in the dev image) and the transient peak DRAM /
+  L1 inside a chunk (steady state after the timing loops: 1322 MiB DRAM,
+  0 L1; legacy 1094 MiB).
+
+Done since the original port: Flash-style SDPA in the block stack, BART
+and DaViT window attention (`TT_FUSED_SDPA=1`, the seq-length padding is
+handled by the kernel's padded-key masking).
 
 ## Caveats
 
-- Single chip only; `device_id=3` is hard-coded in `tt/policy.py`.
+- Single chip only; the chip id is `TT_DEVICE_ID` (default `0`; the
+  original port hard-coded 3).
+- `TT_FUSED*` knobs are read once per process at model build; changing
+  them afterwards has no effect. With `TT_FUSED_TRACE=1` the first chunk
+  after `load_policy_ttnn` captures the two traces (~1 s on top of that
+  chunk; 13.8 s for the chunk itself with a cold kernel cache) —
+  `run_benchmark.py` runs its warm-up chunks before timing, so the
+  capture never lands in a timed run.
 - Synthetic inputs in the benchmark pad language to 16 tokens to keep
   the merged Florence-2 sequence under `max_len_seq=512`. Real-dataset
   eval overrides `config.tokenizer_max_length = 32` for the same reason.
