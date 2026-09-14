@@ -411,6 +411,22 @@ handled by the kernel's padded-key masking).
   policies usually want 4–10 steps. An A/B at `steps ∈ {1, 2, 5, 10}`
   is part of the closed-loop eval follow-up.
 
+## Comparison with an RTX 5090 (same host, 2026-09-14)
+
+action chunk 30×20, 3 views 224×224; 1 step / 10 steps; ratio = p150a ms / GPU ms.
+
+| setting | ms | vs p150a |
+|---|---:|---|
+| p150a, fused traces (served `timing_ms.inference`) | 97.4 / 175.8 | — |
+| RTX 5090 fp32 strict | 34.6 / 95.4 | GPU 2.8× / 1.8× |
+| RTX 5090 bf16 autocast | 15.5 / 43.5 | GPU 6.3× / 4.0× |
+| RTX 5090 fp16 autocast | 15.1 / 43.7 | GPU 6.4× / 4.0× |
+| RTX 5090 bf16 + `torch.compile` (reduce-overhead) | 12.8 / 38.1 | GPU 7.6× / 4.6× |
+
+The p150a path is bound by the DaViT vision tower (48 eager ttnn calls plus ~21 ms of CPU depthwise convolutions, ~73 of 87 ms at 1 step), not by the diffusion steps.
+
+Methodology: same host, this repo's torch reference (same weights and preprocessing as the served p150a path) run eagerly in PyTorch 2.11 cu128 (fp32 weights + `torch.autocast` unless stated; no TensorRT), batch 1, medians of 50 iterations after warm-up, H2D/D2H included; GPU fp32 output matches the CPU fp32 reference (PCC 1.0). p150a rows are the served bf16 fused path incl. upload/readback. p150a power was not measured, so no efficiency comparison is made. Full per-precision table, power and memory: [`GPU_COMPARISON.md`](GPU_COMPARISON.md).
+
 ## License
 
 Apache-2.0. The upstream X-VLA model and lerobot framework are
